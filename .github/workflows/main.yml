@@ -1,0 +1,158 @@
+name: Run Exoplanet Detection Pipeline
+
+on:
+  workflow_dispatch:  # Manual trigger
+  schedule:
+    - cron: '0 0 * * 0'  # Weekly on Sunday at midnight UTC (optional)
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180  # 3 hours timeout
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+        cache: 'pip'
+    
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libhdf5-dev libnetcdf-dev
+    
+    - name: Install Python dependencies
+      run: |
+        pip install --upgrade pip
+        pip install pandas numpy matplotlib seaborn scipy scikit-learn
+        pip install lightgbm imbalanced-learn tqdm joblib
+        pip install requests pathlib
+        pip install batman-package  # Transit modeling
+        
+    - name: Create directory structure
+      run: |
+        mkdir -p data/raw data/processed data/augmented data/synthetic data/tess
+        mkdir -p models models/tess
+        mkdir -p reports/figures reports/figures/augmentation reports/figures/tess
+        mkdir -p reports/validation reports/tess_analysis
+        
+    - name: Run data scraping
+      id: scrape
+      run: |
+        python copy_of_ada.py 2>&1 | tee logs/scrape.log
+      continue-on-error: true
+      
+    - name: Check scraped data
+      run: |
+        if [ -d "data/raw" ]; then
+          echo "Data files created:"
+          ls -lh data/raw/
+        else
+          echo "Warning: No data directory created"
+        fi
+        
+    - name: Run preprocessing (if data exists)
+      if: steps.scrape.outcome == 'success'
+      run: |
+        # Extract preprocessing section and run it
+        python -c "
+        import sys
+        with open('copy_of_ada.py', 'r') as f:
+            code = f.read()
+        # Execute only preprocessing sections
+        # This is a simplified approach - you may need to adjust
+        exec(compile(code, 'copy_of_ada.py', 'exec'))
+        " 2>&1 | tee logs/preprocess.log
+      continue-on-error: true
+        
+    - name: Generate summary report
+      run: |
+        python -c "
+        import json
+        import os
+        from pathlib import Path
+        
+        report = {
+            'timestamp': '$(date -u +%Y-%m-%dT%H:%M:%SZ)',
+            'status': 'completed',
+            'files_created': []
+        }
+        
+        # List all created files
+        for root, dirs, files in os.walk('data'):
+            for file in files:
+                report['files_created'].append(os.path.join(root, file))
+        
+        for root, dirs, files in os.walk('models'):
+            for file in files:
+                report['files_created'].append(os.path.join(root, file))
+                
+        for root, dirs, files in os.walk('reports'):
+            for file in files:
+                report['files_created'].append(os.path.join(root, file))
+        
+        with open('pipeline_summary.json', 'w') as f:
+            json.dump(report, f, indent=2)
+        
+        print(f'Created {len(report[\"files_created\"])} files')
+        "
+        
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: pipeline-outputs-${{ github.run_number }}
+        path: |
+          data/**/*.csv
+          data/**/*.npz
+          data/**/*.json
+          models/**/*.pkl
+          reports/**/*.png
+          reports/**/*.csv
+          reports/**/*.json
+          reports/**/*.md
+          logs/*.log
+          pipeline_summary.json
+        retention-days: 90
+        
+    - name: Commit and push results
+      if: success()
+      run: |
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "github-actions[bot]"
+        
+        # Add generated files
+        git add data/ models/ reports/ pipeline_summary.json || true
+        
+        # Check if there are changes
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "Pipeline run: $(date -u +%Y-%m-%d) [skip ci]"
+          git push
+        fi
+        
+    - name: Create summary
+      if: always()
+      run: |
+        echo "## Pipeline Execution Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Run Date:** $(date -u +%Y-%m-%d\ %H:%M:%S\ UTC)" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [ -f "pipeline_summary.json" ]; then
+          echo "**Files Created:**" >> $GITHUB_STEP_SUMMARY
+          python -c "
+        import json
+        with open('pipeline_summary.json') as f:
+            data = json.load(f)
+        print(f\"- Total files: {len(data['files_created'])}\")
+        " >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
